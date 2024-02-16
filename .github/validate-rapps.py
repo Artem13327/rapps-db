@@ -2,7 +2,7 @@
 PROJECT:     ReactOS rapps-db validator
 LICENSE:     MIT (https://spdx.org/licenses/MIT)
 PURPOSE:     Validate all rapps-db files
-COPYRIGHT:   Copyright 2020,2021 Mark Jansen <mark.jansen@reactos.org>
+COPYRIGHT:   Copyright 2020-2023 Mark Jansen <mark.jansen@reactos.org>
 '''
 import os
 import sys
@@ -24,8 +24,16 @@ ALL_KEYS = [
     b'SizeBytes',
     b'Icon',
     b'Screenshot1',
-    b'LicenseInfo',
+    b'LicenseType',
     b'Languages',
+    b'RegName',
+]
+
+
+REQUIRED_KEYS = [
+    b'Name',
+    b'Category',
+    b'URLDownload',
 ]
 
 
@@ -37,6 +45,16 @@ ALL_ARCH = [
     b'ia64',
     b'ppc',
 ]
+
+LICENSE_TYPES = [
+    1, # Open source
+    2, # Freeware
+    3, # Trial/Demo
+]
+
+
+all_names = {}
+all_urls = {}
 
 
 HEXDIGITS = b'0123456789abcdef'
@@ -55,7 +73,7 @@ class Reporter:
 
     def add(self, line, column, problem):
         self._problems += 1
-        print(f'{line.location(column)}: {problem}')
+        print('{col}: {msg}'.format(col = line.location(column), msg = problem))
         print(line.text())
         idx = column - 1 + len("b'")    # Offset the b' prefix
         print(' ' * idx + '^')
@@ -70,7 +88,9 @@ class RappsLine:
         self._lineno = lineno
         self._text = text
         self._last_col = len(self._text.rstrip())
+        self.main_section = False
         self.key = None
+        self.val = None
         self._entries = []
 
     def add(self, line):
@@ -112,15 +132,19 @@ class RappsLine:
 
         if section_name != b'Section':
             help = 'should always be "Section"'
-            reporter.add(self, self._text.index(section_name) + 1, f'Invalid section name: "{section_name}", {help}')
+            reporter.add(self, self._text.index(section_name) + 1,
+                         'Invalid section name: "{sec}", {msg}'.format(sec = section_name, msg = help))
+        elif not locale:
+            self.main_section = True
 
         if locale:
             if len(locale) not in (2, 4) or not all(c in HEXDIGITS for c in locale):
-                reporter.add(self, self._text.index(locale) + 1, f'Invalid locale{extra_locale}: "{locale}"')
+                reporter.add(self, self._text.index(locale) + 1,
+                             'Invalid locale{extra}: "{loc}"'.format(extra = extra_locale, loc = locale))
 
         if arch:
             if arch not in ALL_ARCH:
-                reporter.add(self, self._text.index(arch) + 1, f'Unknown architecture: "{arch}"')
+                reporter.add(self, self._text.index(arch) + 1, 'Unknown architecture: "%s"' % arch)
 
     def _extract_section_info(self, text, reporter):
         text = text[1:-1]
@@ -137,25 +161,40 @@ class RappsLine:
             else:
                 locale = parts[1]
                 arch = None
-                extra_locale = '(and unknown architecture)'
+                extra_locale = ' (and unknown architecture)'
         elif len(parts) == 3:
             locale = parts[1]
             arch = parts[2]
         else:
             locale = arch = None
-            reporter.add(self, self._text.index(b'[') + 1, f'Unknown section format: "{text}"')
+            reporter.add(self, self._text.index(b'[') + 1, 'Unknown section format: "%s"' % text)
         return section_name, locale, extra_locale, arch
 
     def _parse_key_value(self, reporter, parts):
         # key = value
         assert len(parts) == 2, self
         self.key = parts[0]
+        self.val = parts[1]
+        textkey = self.key.decode()
+        textval = self.val.decode()
 
         if self.key not in ALL_KEYS:
-            reporter.add(self, 0, f'Unknown key: "{self.key}"')
+            reporter.add(self, 0, 'Unknown key: "{key}"'.format(key = textkey))
+
+        if self.key in [b'LicenseType']:
+            v = int(textval, base=10)
+            if v not in LICENSE_TYPES:
+                reporter.add(self, 0, 'Invalid value: "{val}" in {key}'.format(val = v, key = textkey))
+
+        if self.key in [b'License']:
+            v = textval
+            if v.casefold() == 'Unknown'.casefold():
+                # TODO: Reporter should be enabled when the existing DB entries are fixed:
+                # reporter.add(self, 0, 'Invalid value: "{val}" in {key}'.format(val = v, key = textkey))
+                print('Warning: {key} is "{val}" ({file})'.format(val = v, key = textkey, file = self._file.filename))
 
     def location(self, column):
-        return f'{self._file.filename}({self._lineno}:{column})'
+        return '{file}({line}:{col})'.format(file = self._file.filename, line = self._lineno, col = column)
 
     def text(self):
         return self._text
@@ -184,9 +223,56 @@ class RappsFile:
                 assert section, "Got no section yet?"
                 section.add(line)
 
+        all_sections = []
+        main_section = None
+        name = None
+        ver = None
+        url = None
+
         for section in self._sections:
+            uniq_section = section._text.strip().upper()
+            if uniq_section in all_sections:
+                reporter.add(section, 0, 'Duplicate section found!')
+            else:
+                all_sections.append(uniq_section)
+            if not main_section and section.main_section:
+                main_section = section
+                for key in REQUIRED_KEYS:
+                    if not section[key]:
+                        reporter.add(section, 0, 'Main section has no {key} key!'.format(key = key))
             if section[b'URLDownload'] and not section[b'SizeBytes']:
-                reporter.add(section, 0, 'Section has URLDownload but no SizeBytes!')
+                # We allow this, if the main section has a SizeBytes (alternate mirror without duplicating the info)
+                if section == main_section or main_section and not main_section[b'SizeBytes']:
+                    reporter.add(section, 0, 'Section has URLDownload but no SizeBytes!')
+
+            if section[b'Name'] and not name:
+                name = section[b'Name']
+            if section[b'Version'] and not ver:
+                ver = section[b'Version']
+            if section[b'URLDownload'] and not url:
+                url = section[b'URLDownload']
+
+        # Verify that the application name and version is unique
+        if name:
+            global all_names
+            if ver:
+                verify_unique(reporter, all_names, name, name.val + b', version ' + ver.val)
+            else:
+                verify_unique(reporter, all_names, name, name.val)
+
+        # Verify that the download URL is unique
+        if url:
+            global all_urls
+            verify_unique(reporter, all_urls, url, url.val)
+
+
+def verify_unique(reporter, lines, line, name):
+    first = lines.get(name, None)
+    if first:
+        reporter.add(line, 0, 'Duplicate value found: {name}'.format(name = name))
+        reporter.add(first, 0, 'First occurence:')
+    else:
+        lines[name] = line
 
 
 def validate_repo(dirname):
@@ -197,7 +283,7 @@ def validate_repo(dirname):
         entry.parse(reporter)
 
     if reporter.problems():
-        print('Please check https://reactos.org/wiki/index.php?title=RAPPS for details on the file format')
+        print('Please check https://reactos.org/wiki/RAPPS for details on the file format.')
         sys.exit(1)
     else:
         print('No problems found.')
